@@ -17,7 +17,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/range.hpp>
-#include <nav_msgs/msg/odometry.hpp>
+
 #include <std_msgs/msg/bool.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 
@@ -113,9 +113,7 @@ public:
             "/sensor/ultrasonic", 10,
             std::bind(&RealtimeSystemNode::ultrasonic_callback, this, std::placeholders::_1));
         
-        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/odom", 10,
-            std::bind(&RealtimeSystemNode::odom_callback, this, std::placeholders::_1));
+
         
         // ROS2 Publishers (for monitoring/debugging)
         emergency_pub_ = this->create_publisher<std_msgs::msg::Bool>("/emergency_stop", 10);
@@ -275,9 +273,7 @@ private:
         ultrasonic_distance_ = msg->range;
     }
     
-    void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-        current_velocity_ = msg->twist.twist.linear.x;
-    }
+
     
     void control_loop() {
         // Start timing (high-resolution monotonic clock)
@@ -502,7 +498,7 @@ private:
     // ═════════════════════════════════════════════════════════════════════
     // ROS2 interfaces
     rclcpp::Subscription<sensor_msgs::msg::Range>::SharedPtr ultrasonic_sub_;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
