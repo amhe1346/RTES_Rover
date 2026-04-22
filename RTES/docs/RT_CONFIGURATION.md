@@ -88,26 +88,26 @@ sudo ~/ROS2_Deploy/RTES/scripts/restore_cpus.sh
 
 ## Features Implemented
 
-### Phase 1: Memory Locking ✓
+### Phase 1: Memory Locking 
 - **mlockall(MCL_CURRENT | MCL_FUTURE)** prevents page faults
 - Pre-allocates all buffers at startup
 - Graceful fallback if permissions denied
 - Configurable via `enable_mlockall` parameter
 
-### Phase 2: POSIX Real-Time Scheduling ✓
+### Phase 2: POSIX Real-Time Scheduling 
 - **SCHED_FIFO** with configurable priority (default: 80)
 - Preempts all non-RT processes
 - Guaranteed deterministic execution order
 - Configurable via `rt_priority` parameter
 
-### Phase 3: Dynamic CPU Isolation ✓
+### Phase 3: Dynamic CPU Isolation 
 - **Runtime-only isolation** using cpuset cgroups
 - No kernel changes required (no reboot)
 - Automatically reversed when node stops
 - Scripts: `isolate_cpu.sh` and `restore_cpus.sh`
 - Configurable via `cpu_affinity` parameter
 
-### Phase 4: Performance Tracking ✓
+### Phase 4: Performance Tracking 
 - **CSV logging** with microsecond timestamps
 - Statistics: mean, std dev, min, max, jitter, CV
 - Deadline miss tracking and analysis
@@ -115,7 +115,7 @@ sudo ~/ROS2_Deploy/RTES/scripts/restore_cpus.sh
 - Emergency stop detection
 - Analysis script: `analyze_performance.py`
 
-### Phase 5: Arduino Optimization ✓
+### Phase 5: Arduino Optimization 
 - **115200 baud** (12x faster than 9600)
 - Non-blocking serial processing
 - Direct GPIO control (<50μs execution)
@@ -226,12 +226,12 @@ ROS2_Deploy/RTES/
 ```
 
 **Expected output:**
-- ✓ SCHED_FIFO enabled with priority 80
-- ✓ Pinned to core 2
-- ✓ Core 2 is isolated
-- ✓ Memory locking enabled
-- ✓ CAP_SYS_NICE present
-- ✓ CAP_IPC_LOCK present
+-  SCHED_FIFO enabled with priority 80
+-  Pinned to core 2
+-  Core 2 is isolated
+-  Memory locking enabled
+-  CAP_SYS_NICE present
+-  CAP_IPC_LOCK present
 
 ### 2. Analyze Performance Data
 
@@ -288,12 +288,12 @@ sudo nano /etc/security/limits.conf
 ### Issue: High deadline miss rate (>5%)
 
 **Checklist:**
-1. ✓ RT features enabled? (`enable_rt:=true`)
-2. ✓ CPU affinity set? (`cpu_affinity:=2`)
-3. ✓ Core isolated? (`sudo ./scripts/isolate_cpu.sh 2`)
-4. ✓ Memory locked? (`enable_mlockall:=true`)
-5. ✓ Close background apps? (VSCode, browsers)
-6. ✓ Arduino running at 115200 baud?
+1.  RT features enabled? (`enable_rt:=true`)
+2. CPU affinity set? (`cpu_affinity:=2`)
+3.  Core isolated? (`sudo ./scripts/isolate_cpu.sh 2`)
+4.  Memory locked? (`enable_mlockall:=true`)
+5. Close background apps? (VSCode, browsers)
+6.  Arduino running at 115200 baud?
 
 ### Issue: System freezes during build
 
@@ -353,9 +353,9 @@ ros2 launch trashbot_rtes full_system.launch.py \
 
 | Configuration | Exec Time | Jitter | Misses | Notes |
 |--------------|-----------|--------|--------|-------|
-| Default (no RT) | ~2-5ms | ~10ms | 20-40% | ❌ Unacceptable |
-| RT without isolation | ~0.5-1ms | ~2ms | 2-5% | ⚠ Marginal |
-| RT with isolation | ~0.3-0.6ms | ~0.5ms | <1% | ✓ Excellent |
+| Default (no RT) | ~2-5ms | ~10ms | 20-40% |  Unacceptable |
+| RT without isolation | ~0.5-1ms | ~2ms | 2-5% |  Marginal |
+| RT with isolation | ~0.3-0.6ms | ~0.5ms | <1% |  Excellent |
 
 ---
 
@@ -408,9 +408,3 @@ For issues or questions:
 2. Analyze CSV with `analyze_performance.py`
 3. Review system logs: `journalctl -u` or `dmesg`
 4. Check this documentation and troubleshooting section
-
----
-
-**Last Updated:** April 21, 2026  
-**Version:** 1.0  
-**Status:** Production Ready 
