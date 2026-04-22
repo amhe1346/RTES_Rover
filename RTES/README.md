@@ -225,20 +225,3 @@ echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governo
 4. **Measure latency** → Use `ros2 topic hz` and logs
 5. **Deploy** → Use production launch for final system
 
-## Future Enhancements
-
-- [ ] Add side ultrasonic sensors for better path planning
-- [ ] Implement Micro-ROS on ESP32 for true hard real-time
-- [ ] Add data logging to rosbag2
-- [ ] Create rviz2 visualization
-- [ ] Implement stopping distance measurement procedure
-
-## References
-
-- ROS2 Humble Documentation: https://docs.ros.org/en/humble/
-- Real-Time Linux (PREEMPT_RT): https://wiki.linuxfoundation.org/realtime/
-- Micro-ROS: https://micro.ros.org/
-
-## License
-
-MIT License - See LICENSE file for details
