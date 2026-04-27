@@ -12,7 +12,7 @@
 #define OBSTACLE_THRESHOLD_M 0.68f   // Distance to start avoiding (meters)
 #define CLEAR_DISTANCE_M 1.5f       // Distance considered clear
 #define TURN_DURATION_MS 800        // Typical turn duration
-#define PATH_PLANNER_STOP_DISTANCE_M 0.5f // planner-specific hard stop distance
+#define PATH_PLANNER_STOP_DISTANCE_M 0.01f // planner-specific hard stop distance
 
 // Robot dimensions and opening detection
 #define ROBOT_WIDTH_M 0.23f         // Robot width: 9 inches

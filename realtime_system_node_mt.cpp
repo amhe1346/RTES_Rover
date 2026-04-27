@@ -11,8 +11,7 @@
  * 
  * Synchronization:
  * - Atomics for lock-free single-writer/reader: emergency_flag, path_command
- * - Mutex for sensor data (multiple readers: emergency, planning threads)
- * - ROS2 odometry callback uses same sensor_mutex for consistency
+ * - Mutex for sensor data (multiple readers: emergency, planning, motor threads)
  * 
  * Benefits:
  * - 50-70% CPU reduction (no polling at 1kHz)
@@ -29,9 +28,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/range.hpp>
-#include <nav_msgs/msg/odometry.hpp>
 #include <std_msgs/msg/bool.hpp>
-#include <geometry_msgs/msg/twist.hpp>
 
 #include <fcntl.h>
 #include <termios.h>
@@ -147,6 +144,7 @@ public:
         , planning_thread_started_(false)
         , motor_thread_started_(false)
         , emergency_flag_(false)
+        , emergency_stop_latched_(false)
         , path_command_(MOTOR_FORWARD)
         , emergency_stats_(ThreadConfig::EMERGENCY_NAME, ThreadConfig::EMERGENCY_PERIOD_MS)
         , planning_stats_(ThreadConfig::PLANNING_NAME, ThreadConfig::PLANNING_PERIOD_MS)
@@ -164,6 +162,8 @@ public:
         this->declare_parameter("deadline_us", 10000);  // Used for emergency thread
         this->declare_parameter("enable_csv_logging", true);
         this->declare_parameter("csv_output_path", "/tmp/rtes_performance_mt.csv");
+        this->declare_parameter("enable_latency_logging", true);
+        this->declare_parameter("latency_output_path", "/tmp/rtes_safety_latency_mt.csv");
         this->declare_parameter("enable_ultrasonic_gpio", true);
         this->declare_parameter("use_rt_gpio", true);
         this->declare_parameter("ultrasonic_trigger_pin", 24);
@@ -178,6 +178,8 @@ public:
         enable_mlockall_ = this->get_parameter("enable_mlockall").as_bool();
         enable_csv_logging_ = this->get_parameter("enable_csv_logging").as_bool();
         csv_output_path_ = this->get_parameter("csv_output_path").as_string();
+        enable_latency_logging_ = this->get_parameter("enable_latency_logging").as_bool();
+        latency_output_path_ = this->get_parameter("latency_output_path").as_string();
         enable_ultrasonic_gpio_ = this->get_parameter("enable_ultrasonic_gpio").as_bool();
         use_rt_gpio_ = this->get_parameter("use_rt_gpio").as_bool();
         int trigger_pin = this->get_parameter("ultrasonic_trigger_pin").as_int();
@@ -248,11 +250,9 @@ public:
         if (enable_csv_logging_) {
             init_csv_logging();
         }
-        
-        // ROS2 subscriptions
-        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/odom", 10,
-            std::bind(&RealtimeSystemNodeMT::odometry_callback, this, std::placeholders::_1));
+        if (enable_latency_logging_) {
+            init_latency_logging();
+        }
         
         // ROS2 publishers
         ultrasonic_pub_ = this->create_publisher<sensor_msgs::msg::Range>("/sensor/ultrasonic", 10);
@@ -262,7 +262,6 @@ public:
         {
             std::lock_guard<std::mutex> lock(sensor_mutex_);
             ultrasonic_distance_ = 10.0f;  // Far away
-            current_velocity_ = 0.0f;
         }
         
         RCLCPP_INFO(this->get_logger(), "═══════════════════════════════════════");
@@ -309,6 +308,11 @@ public:
             write_performance_summary();
             csv_file_.close();
             RCLCPP_INFO(this->get_logger(), " Performance data saved to %s", csv_output_path_.c_str());
+        }
+        if (latency_file_.is_open()) {
+            latency_file_.flush();
+            latency_file_.close();
+            RCLCPP_INFO(this->get_logger(), " Safety latency data saved to %s", latency_output_path_.c_str());
         }
         
         RCLCPP_INFO(this->get_logger(), "Multi-Threaded RTES Node SHUTDOWN");
@@ -471,11 +475,13 @@ private:
             clock_gettime(CLOCK_MONOTONIC, &start_ts);
             
             // Read sensor data (protected by mutex)
-            float distance, velocity;
+            float distance;
+            uint64_t sample_id;
+            constexpr float velocity = 0.0f;
             {
                 std::lock_guard<std::mutex> lock(sensor_mutex_);
                 distance = ultrasonic_distance_;
-                velocity = current_velocity_;
+                sample_id = ultrasonic_sample_id_;
             }
             
             // SERVICE 1: Emergency Stop Check
@@ -486,10 +492,27 @@ private:
             emergency_flag_.store(emergency, std::memory_order_release);
             
             if (emergency) {
+                uint64_t event_id = active_emergency_event_id_.load(std::memory_order_acquire);
+                if (event_id == 0) {
+                    event_id = emergency_event_counter_.fetch_add(1, std::memory_order_acq_rel) + 1;
+                    active_emergency_event_id_.store(event_id, std::memory_order_release);
+                    active_emergency_sample_id_.store(sample_id, std::memory_order_release);
+                    log_latency_event(event_id, sample_id, "emergency", "detect", MOTOR_STOP, distance, emergency_state.ttc, -1);
+                }
+
+                // Send one immediate STOP on emergency edge to reduce stop latency.
+                if (!emergency_stop_latched_.exchange(true, std::memory_order_acq_rel)) {
+                    send_motor_command(MOTOR_STOP, "emergency", event_id, sample_id);
+                }
+
                 // Publish emergency status
                 auto msg = std_msgs::msg::Bool();
                 msg.data = true;
                 emergency_pub_->publish(msg);
+            } else {
+                active_emergency_event_id_.store(0, std::memory_order_release);
+                active_emergency_sample_id_.store(0, std::memory_order_release);
+                emergency_stop_latched_.store(false, std::memory_order_release);
             }
             
             // Calculate timing
@@ -507,7 +530,6 @@ private:
                 exec_us,
                 jitter_us,
                 distance,
-                velocity,
                 emergency,
                 emergency_state.ttc);
             
@@ -531,6 +553,7 @@ private:
             // Read ultrasonic sensor
             float distance_m = 10.0f;  // Default: far away
             bool valid = false;
+            uint64_t sample_id = 0;
             
             if (enable_ultrasonic_gpio_) {
                 if (use_rt_gpio_) {
@@ -540,11 +563,24 @@ private:
                 }
                 
                 if (valid) {
+                    sample_id = sensor_sample_counter_.fetch_add(1, std::memory_order_acq_rel) + 1;
+
                     // Update sensor data (protected by mutex)
                     {
                         std::lock_guard<std::mutex> lock(sensor_mutex_);
                         ultrasonic_distance_ = distance_m;
+                        ultrasonic_sample_id_ = sample_id;
                     }
+
+                    log_latency_event(
+                        0,
+                        sample_id,
+                        "sensor",
+                        "sensor_update",
+                        MOTOR_FORWARD,
+                        distance_m,
+                        std::numeric_limits<float>::infinity(),
+                        -1);
                     
                     // Publish Range message
                     auto msg = sensor_msgs::msg::Range();
@@ -567,20 +603,14 @@ private:
             
             sensor_stats_.record_cycle(exec_us, jitter_us);
 
-            // Include latest command/emergency context for sensor timing traces.
+            // Include latest emergency context for sensor timing traces.
             bool emergency = emergency_flag_.load(std::memory_order_acquire);
-            float velocity_snapshot;
-            {
-                std::lock_guard<std::mutex> lock(sensor_mutex_);
-                velocity_snapshot = current_velocity_;
-            }
             log_thread_trace(
                 ThreadConfig::SENSOR_NAME,
                 sensor_stats_.cycle_count,
                 exec_us,
                 jitter_us,
                 distance_m,
-                velocity_snapshot,
                 emergency,
                 std::numeric_limits<float>::infinity());
             
@@ -596,26 +626,44 @@ private:
         clock_gettime(CLOCK_MONOTONIC, &next_wake);
         
         const int64_t period_ns = ThreadConfig::PLANNING_PERIOD_MS * 1000000LL;
+        uint64_t last_logged_sample_id = 0;
         
         while (threads_running_) {
             struct timespec start_ts;
             clock_gettime(CLOCK_MONOTONIC, &start_ts);
 
             // Read sensor data (protected by mutex)
-            float distance, velocity;
+            float distance;
+            uint64_t sample_id;
+            constexpr float velocity = 0.0f;
             {
                 std::lock_guard<std::mutex> lock(sensor_mutex_);
                 distance = ultrasonic_distance_;
-                velocity = current_velocity_;
+                sample_id = ultrasonic_sample_id_;
             }
 
             // SERVICE 2: Path Planning
             // Always compute the latest command. Emergency gating is handled
-            // by motor_thread_func() before commands are sent to hardware.
+            // by emergency_thread_func()/motor_thread_func() before commands
+            // are sent to hardware.
             PathCommand path_cmd = compute_path_command(distance, velocity);
 
             // Update path command (atomic, lock-free)
             path_command_.store(path_cmd.command, std::memory_order_release);
+            latest_planning_sample_id_.store(sample_id, std::memory_order_release);
+
+            if (sample_id != 0 && sample_id != last_logged_sample_id) {
+                log_latency_event(
+                    0,
+                    sample_id,
+                    "planning",
+                    "plan_update",
+                    path_cmd.command,
+                    distance,
+                    std::numeric_limits<float>::infinity(),
+                    -1);
+                last_logged_sample_id = sample_id;
+            }
             
             // Calculate timing
             struct timespec end_ts;
@@ -632,7 +680,6 @@ private:
                 exec_us,
                 jitter_us,
                 distance,
-                velocity,
                 emergency,
                 std::numeric_limits<float>::infinity());
             
@@ -669,7 +716,13 @@ private:
             // SERVICE 3: Motor Control
             MotorControlState motor_state;
             execute_motor_command(cmd_to_send, 1, &motor_state);
-            send_motor_command(cmd_to_send);
+            const uint64_t event_id = emergency
+                ? active_emergency_event_id_.load(std::memory_order_acquire)
+                : 0;
+            const uint64_t sample_id = emergency
+                ? active_emergency_sample_id_.load(std::memory_order_acquire)
+                : latest_planning_sample_id_.load(std::memory_order_acquire);
+            send_motor_command(cmd_to_send, "motor", event_id, sample_id);
             
             // Calculate timing
             struct timespec end_ts;
@@ -680,11 +733,9 @@ private:
             motor_stats_.record_cycle(exec_us, jitter_us);
 
             float distance_snapshot;
-            float velocity_snapshot;
             {
                 std::lock_guard<std::mutex> lock(sensor_mutex_);
                 distance_snapshot = ultrasonic_distance_;
-                velocity_snapshot = current_velocity_;
             }
             log_thread_trace(
                 ThreadConfig::MOTOR_NAME,
@@ -692,7 +743,6 @@ private:
                 exec_us,
                 jitter_us,
                 distance_snapshot,
-                velocity_snapshot,
                 emergency,
                 std::numeric_limits<float>::infinity());
             
@@ -701,16 +751,6 @@ private:
             normalize_timespec(&next_wake);
             clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_wake, nullptr);
         }
-    }
-    
-    // ═════════════════════════════════════════════════════════════════════
-    // ROS2 CALLBACKS
-    // ═════════════════════════════════════════════════════════════════════
-    
-    void odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-        // Update velocity (protected by same mutex as sensor data)
-        std::lock_guard<std::mutex> lock(sensor_mutex_);
-        current_velocity_ = std::abs(msg->twist.twist.linear.x);
     }
     
     // ═════════════════════════════════════════════════════════════════════
@@ -757,12 +797,25 @@ private:
         }
     }
     
-    void send_motor_command(MotorCommand cmd) {
+    void send_motor_command(MotorCommand cmd,
+                            const char* source_thread = "unknown",
+                            uint64_t event_id = 0,
+                            uint64_t sample_id = 0) {
+        std::lock_guard<std::mutex> lock(serial_mutex_);
         if (serial_fd_front_ < 0) return;
 
         char cmd_char = motor_command_to_char(cmd);
         
-        write(serial_fd_front_, &cmd_char, 1);
+        const ssize_t bytes_written = write(serial_fd_front_, &cmd_char, 1);
+        log_latency_event(
+            event_id,
+            sample_id,
+            source_thread,
+            "serial_write",
+            cmd,
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::quiet_NaN(),
+            bytes_written);
     }
     
     // ═════════════════════════════════════════════════════════════════════
@@ -790,10 +843,59 @@ private:
             }
         }
         
-        csv_file_ << "thread,cycle,exec_us,jitter_us,distance_m,velocity_ms,emergency,ttc\n";
+        csv_file_ << "thread,cycle,exec_us,jitter_us,distance_m,emergency,ttc\n";
         csv_file_.flush();
         
         RCLCPP_INFO(this->get_logger(), "✓ CSV logging initialized: %s", csv_output_path_.c_str());
+    }
+
+    void init_latency_logging() {
+        latency_file_.open(latency_output_path_, std::ios::out | std::ios::trunc);
+        if (!latency_file_.is_open()) {
+            const std::string fallback_path = "/tmp/rtes_safety_latency_mt_" + std::to_string(getpid()) + ".csv";
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Failed to open latency CSV file: %s. Trying fallback path: %s",
+                latency_output_path_.c_str(),
+                fallback_path.c_str());
+
+            latency_output_path_ = fallback_path;
+            latency_file_.clear();
+            latency_file_.open(latency_output_path_, std::ios::out | std::ios::trunc);
+
+            if (!latency_file_.is_open()) {
+                RCLCPP_ERROR(this->get_logger(), "Failed to open fallback latency CSV file: %s", latency_output_path_.c_str());
+                enable_latency_logging_ = false;
+                return;
+            }
+        }
+
+        latency_file_ << "event_id,sample_id,source_thread,event_type,timestamp_us,command,distance_m,ttc,bytes_written\n";
+        latency_file_.flush();
+        RCLCPP_INFO(this->get_logger(), "✓ Safety latency logging initialized: %s", latency_output_path_.c_str());
+    }
+
+    void log_latency_event(uint64_t event_id,
+                           uint64_t sample_id,
+                           const char* source_thread,
+                           const char* event_type,
+                           MotorCommand command,
+                           float distance,
+                           float ttc,
+                           ssize_t bytes_written) {
+        if (!enable_latency_logging_ || !latency_file_.is_open()) return;
+
+        std::lock_guard<std::mutex> lock(latency_mutex_);
+        latency_file_ << event_id << ","
+                      << sample_id << ","
+                      << source_thread << ","
+                      << event_type << ","
+                      << monotonic_time_us() << ","
+                      << motor_command_to_char(command) << ","
+                      << distance << ","
+                      << ttc << ","
+                      << bytes_written << "\n";
+        latency_file_.flush();
     }
     
     void log_thread_trace(const char* thread_name,
@@ -801,7 +903,6 @@ private:
                           int64_t exec_us,
                           int64_t jitter_us,
                           float distance,
-                          float velocity,
                           bool emergency,
                           float ttc) {
         if (!enable_csv_logging_ || !csv_file_.is_open()) return;
@@ -812,7 +913,6 @@ private:
                   << exec_us << ","
                   << jitter_us << ","
                   << distance << ","
-                  << velocity << ","
                   << (emergency ? "1," : "0,")
                   << ttc << "\n";
 
@@ -853,6 +953,12 @@ private:
         int64_t nsec_diff = end->tv_nsec - start->tv_nsec;
         return sec_diff * 1000000LL + nsec_diff / 1000LL;
     }
+
+    static uint64_t monotonic_time_us() {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL + ts.tv_nsec / 1000ULL;
+    }
     
     static void normalize_timespec(struct timespec* ts) {
         while (ts->tv_nsec >= 1000000000L) {
@@ -868,10 +974,12 @@ private:
     // Configuration
     std::string serial_port_front_;
     std::string csv_output_path_;
+    std::string latency_output_path_;
     bool enable_rt_;
     int cpu_affinity_;
     bool enable_mlockall_;
     bool enable_csv_logging_;
+    bool enable_latency_logging_;
     bool enable_ultrasonic_gpio_;
     bool use_rt_gpio_;
     
@@ -888,14 +996,22 @@ private:
     
     // Thread synchronization
     std::atomic<bool> emergency_flag_;                    // Lock-free: emergency → motor
+    std::atomic<bool> emergency_stop_latched_;            // Dedupes direct emergency STOP writes
+    std::atomic<uint64_t> emergency_event_counter_{0};    // Monotonic emergency event ids
+    std::atomic<uint64_t> active_emergency_event_id_{0};  // Current emergency event id while active
+    std::atomic<uint64_t> active_emergency_sample_id_{0}; // Sensor sample that triggered emergency edge
+    std::atomic<uint64_t> sensor_sample_counter_{0};      // Monotonic sensor sample ids
+    std::atomic<uint64_t> latest_planning_sample_id_{0};  // Latest sensor sample used by planning
     std::atomic<MotorCommand> path_command_;             // Lock-free: planning → motor
     std::mutex sensor_mutex_;                             // Protects sensor data (multiple readers)
     std::mutex csv_mutex_;                                // Protects CSV file writes
+    std::mutex latency_mutex_;                            // Protects latency CSV writes
+    std::mutex serial_mutex_;                             // Protects serial writes across threads
     uint64_t csv_pending_rows_ = 0;
     
     // Sensor data (protected by sensor_mutex_)
     float ultrasonic_distance_;
-    float current_velocity_;
+    uint64_t ultrasonic_sample_id_ = 0;
     
     // Performance tracking
     ThreadPerformanceStats emergency_stats_;
@@ -909,12 +1025,12 @@ private:
     UltrasonicHCSR04RT ultrasonic_sensor_rt_;
     
     // ROS2 interfaces
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr ultrasonic_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_pub_;
     
     // CSV logging
     std::ofstream csv_file_;
+    std::ofstream latency_file_;
 };
 
 // ═════════════════════════════════════════════════════════════════════
